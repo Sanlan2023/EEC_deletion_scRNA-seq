@@ -1,0 +1,272 @@
+##This script is for analyzing multiplexed single cell RNA-seq data from Neurog3CoKO mice
+####load related packages####
+library(tidyverse)
+library(Seurat)
+library(SeuratObject)
+library(hdf5r)
+library(SeuratDisk)
+library(dplyr)
+library(Matrix)
+library(ggplot2)
+library(sctransform)
+library(rgl)
+library(cowplot)
+library(patchwork)
+library(fields)
+library(DoubletFinder)
+library(parallel)
+library(EnhancedVolcano)
+
+#load my color collections
+my36colors <- c("#E5D2DD", "#53A85F", "#F1BB72", "#F3B1A0", "#D6E7A3", "#57C3F3", "#476D87",
+                "#E95C59", "#E59CC4", "#AB3282", "#23452F", "#BD956A", "#8C549C", "#585658",
+                "#9FA3A8", "#E0D4CA", "#5F3D69", "#C5DEBA", "#58A4C3", "#E4C755", "#F7F398",
+                "#AA9A59", "#E63863", "#E39A35", "#C1E6F3", "#6778AE", "#91D0BE", "#B53E2B",
+                "#712820", "#DCC1DD", "#CCE0F5", "#CCC9E6", "#625D9E", "#68A180", "#3A6963",
+                "#968175")
+
+my5colors <- c("#ff595e", # red
+               "#ffca3a", # yellow
+               "#8ac926", # green
+               "#1982c4", # blue
+               "#6a4c93") # purple
+
+my5colors.1 <- c("#91D1C2","#ADB6B6", "#3C5488", "#8491B4", "#F39B7F")
+
+####load data####
+#read data in h5 file format into 10X format
+colon1 <- Read10X_h5("Data/ngn3ko_multiplex/raw_data/sample1_feature_bc_matrix.h5", use.names = TRUE, unique.features = TRUE)
+colon932 <- Read10X_h5("Data/ngn3ko_multiplex/raw_data/sample932_feature_bc_matrix.h5", use.names = TRUE, unique.features = TRUE)
+colon925 <- Read10X_h5("Data/ngn3ko_multiplex/raw_data/sample925_feature_bc_matrix.h5", use.names = TRUE, unique.features = TRUE)
+colon3 <- Read10X_h5("Data/ngn3ko_multiplex/raw_data/sample3_feature_bc_matrix.h5", use.names = TRUE, unique.features = TRUE)
+
+#create Seurat object
+#use only "Gene Expression" data set but not Multiplex data to create Seurat object
+Ngn3KO.1 <- CreateSeuratObject(counts = colon1$`Gene Expression`, project = "Ngn3KO_colon_epi1", min.cells = 3, min.features = 200)
+Ngn3KO.2 <- CreateSeuratObject(counts = colon932$`Gene Expression`, project = "Ngn3KO_colon_epi2", min.cells = 3, min.features = 200)
+Ngn3WT.1 <- CreateSeuratObject(counts = colon3$`Gene Expression`, project = "WT_colon_epi1", min.cells = 3, min.features = 200)
+Ngn3WT.2 <- CreateSeuratObject(counts = colon925$`Gene Expression`, project = "WT_colon_epi2", min.cells = 3, min.features = 200)
+
+#combine the 2 WT data set first
+Ctrl.colon <- merge(Ngn3WT.1, y = Ngn3WT.2, project = "Control_colon")
+
+#combine the Control colon with Ngn3 KO colon-1
+Ngn3KO.colon <- merge(Ctrl.colon, y = Ngn3KO.1, add.cell.ids = c("Ctrl","Ngn3KO"), project = "Merge_Ngn3KO colon")
+
+Ngn3KO.colon$experiment <- sub("_.*", "", colnames(Ngn3KO.colon))
+
+####data QC####
+##Calculate the percentage Mitochondria gene and add to the meta data##
+Ngn3KO.colon[["percent.mt"]] <- PercentageFeatureSet(Ngn3KO.colon, pattern = "^mt-")
+
+#Check the nFeature&nCount&percent.mt#
+VlnPlot(Ngn3KO.colon, features = c("nFeature_RNA","nCount_RNA", "percent.mt"), ncol = 3)
+#save the QC files
+ggsave("figures/ngn3ko_multiplex/nFeature_RNA$nCount_RNA&mito_QC.png", width = 10, height = 5)
+
+####post QC filter####
+#remove cells with low quality cells
+Ngn3KO.colon <- subset(Ngn3KO.colon, subset = nFeature_RNA >200 & nCount_RNA > 1000  & percent.mt <15)
+VlnPlot(Ngn3KO.colon, features = c("nFeature_RNA","nCount_RNA","percent.mt"), ncol = 3)
+ggsave("figures/ngn3ko_multiplex/Filter.QC_15PercentMito.png", width = 10, height = 5)
+FeatureScatter(Ngn3KO.colon, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+ggsave("figures/ngn3ko_multiplex/FeatureScatterFilter.pdf", width = 5, height = 5)
+
+####remove doublets####
+#run tSNE first before finding doublets
+#pre-process data using standard workflow for QC
+set.seed(1234)
+Ngn3KO.colon <- Ngn3KO.colon %>% NormalizeData() %>% FindVariableFeatures() %>% ScaleData() %>% RunPCA()
+DimHeatmap(Ngn3KO.colon, dims = 1:30, cells = 500, balanced = TRUE)
+ElbowPlot(Ngn3KO.colon, ndims = 50)
+dimensions <- 1:15
+Ngn3KO.colon <- Ngn3KO.colon %>% RunTSNE(dims = dimensions) %>% FindNeighbors(dims = dimensions) %>% FindClusters(resolution = 1)
+
+##doublets finder
+#pK Identification (no ground-truth)
+sweep.res.list <- paramSweep(Ngn3KO.colon, PCs = dimensions, sct = F)
+sweep.stats <- summarizeSweep(sweep.res.list, GT = FALSE)
+bcmvn <- find.pK(sweep.stats)
+pK_bcmvn <- bcmvn$pK[which.max(bcmvn$BCmetric)] %>% as.character() %>% as.numeric()
+
+#Homotypic Doublet Proportion Estimate
+DoubletRate <- 0.08
+homotypic.prop <- modelHomotypic(Ngn3KO.colon$RNA_snn_res.1)
+nExp_poi <- round(DoubletRate*ncol(Ngn3KO.colon))
+nExp_poi.adj <- round(nExp_poi*(1-homotypic.prop))
+
+#Run DoubletFinder with varying classification stringencies
+Ngn3KO.colon <- doubletFinder(Ngn3KO.colon, PCs = dimensions, pN = 0.25, pK = pK_bcmvn, nExp = nExp_poi.adj, reuse.pANN = F, sct = T)
+
+#visuzalization
+Ngn3KO.colon@meta.data %>% colnames()
+#p1 <- DimPlot(Ngn3KO.colon, reduction = "tsne", group.by = "DF.classifications_0.25_0.07_404", split.by = "experiment", cols = my36colors)+ NoLegend()
+#p2 <- DimPlot(Ngn3KO.colon, reduction = "tsne", group.by = "RNA_snn_res.1", split.by = "experiment",cols = my36colors)+ NoLegend()
+p1 <- DimPlot(Ngn3KO.colon, reduction = "tsne", group.by = "DF.classifications_0.25_0.07_404", split.by = "experiment", cols = my36colors)+ NoLegend()
+p2 <- DimPlot(Ngn3KO.colon, reduction = "tsne", group.by = "RNA_snn_res.1", split.by = "experiment",cols = my36colors)+ NoLegend()
+p1+p2
+ggsave("figures/ngn3ko_multiplex/Doublelet.res1.png", width =6, height = 6)
+VlnPlot(Ngn3KO.colon, features = c("nFeature_RNA", "nCount_RNA","percent.mt"), ncol = 3,pt.size = 0.01, group.by = "DF.classifications_0.25_0.07_404" )
+ggsave("figures/ngn3ko_multiplex/Doublelet&nFeature.png", width =10, height = 10)
+
+Doublets <- table(Ngn3KO.colon$RNA_snn_res.1, Ngn3KO.colon$DF.classifications_0.25_0.07_404, Ngn3KO.colon$experiment)
+write.csv(Doublets, "figures/ngn3ko_multiplex/Doublelet.res1.csv")
+
+#remove the doublets
+Idents(Ngn3KO.colon) <- "DF.classifications_0.25_0.07_404"
+Ngn3KO.colon <- subset(Ngn3KO.colon, ident = "Singlet")
+
+####regress out mitochondria genes and run SCT transformation####
+Ngn3KO.colon <- SCTransform(Ngn3KO.colon, vars.to.regress = "percent.mt", verbose = FALSE)
+
+#### visualization and clustering ####
+Ngn3KO.colon <- RunPCA(Ngn3KO.colon, verbose = FALSE)
+Ngn3KO.colon <- RunUMAP(Ngn3KO.colon, dims = 1:30, umap.method = "uwot",metric = "cosine", verbose = TRUE)
+
+Ngn3KO.colon <- Ngn3KO.colon %>%
+  FindNeighbors(dims = 1:30)
+
+for (resolution in c(0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7,0.8, 1.0, 1.5)) {
+  Ngn3KO.colon <- Ngn3KO.colon %>%
+    FindClusters(resolution = resolution)}
+
+p1 <- DimPlot(Ngn3KO.colon, reduction = "umap", label = T, cols = my36colors, group.by = "SCT_snn_res.0.1") + coord_equal() + NoLegend()
+p2 <- DimPlot(Ngn3KO.colon, reduction = "umap", label = T, cols = my36colors,group.by = "SCT_snn_res.0.2") + coord_equal() + NoLegend()
+p3 <- DimPlot(Ngn3KO.colon, reduction = "umap", label = T, cols = my36colors,group.by = "SCT_snn_res.0.3") + coord_equal() + NoLegend()
+p4 <- DimPlot(Ngn3KO.colon, reduction = "umap", label = T, cols = my36colors,group.by = "SCT_snn_res.0.5") + coord_equal() + NoLegend()
+p6 <- DimPlot(Ngn3KO.colon, reduction = "umap", label = T, cols = my36colors,group.by = "SCT_snn_res.0.8") + coord_equal() + NoLegend()
+p7 <- DimPlot(Ngn3KO.colon, reduction = "umap", label = T, cols = my36colors,group.by = "SCT_snn_res.1") + coord_equal() + NoLegend()
+p8 <- DimPlot(Ngn3KO.colon, reduction = "umap", label = T, cols = my36colors,group.by = "SCT_snn_res.1.5") + coord_equal() + NoLegend()
+plot_grid(p1,p2,p3,p4,p6,p7,p8,nrow = 2)
+
+ggsave("figures/ngn3ko_multiplex/umap.SCT.res0.1_1.5.png", width = 10, height = 5.5)
+
+DimPlot(Ngn3KO.colon, reduction = "umap", label = T, cols = my36colors, group.by = "SCT_snn_res.0.1", split.by = "experiment") + coord_equal() + NoLegend()
+ggsave("figures/ngn3ko_multiplex/umap.SCT.res0.1.png", width = 8, height = 4)
+
+#Find markers for each cluster
+Idents(Ngn3KO.colon) <- "SCT_snn_res.0.1"
+Ngn3KO.colon.markers <- FindAllMarkers(Ngn3KO.colon, only.pos = TRUE, min.pct = 0.1, logfc.threshold = 0.5)
+write.csv(Ngn3KO.colon.markers,"figures/ngn3ko_multiplex/Ngn3KO.colon.markers.lfc0.5.csv")
+top.Ngn3KO.colon.markers <- Ngn3KO.colon.markers %>% group_by(cluster) %>% top_n(n = 8, wt = avg_log2FC)
+
+#heatmap for markers
+DoHeatmap(Ngn3KO.colon, top.Ngn3KO.colon.markers$gene, angle = 45)
+ggsave("figures/ngn3ko_multiplex/Heatmap.final.Res0.1.png", width =10, height = 10)
+
+#annotate the scRNA-seq data based on top cluster markers and keep main epithelial subtypes
+annotation1 <- c("Goblet Cell","Progenitor","Colonocytes","Tuft Cell","Goblet Cell","EEC")
+Idents(Ngn3KO.colon) <- Ngn3KO.colon$SCT_snn_res.0.1
+names(annotation1) <- levels(Ngn3KO.colon)
+Ngn3KO.colon <- RenameIdents(Ngn3KO.colon, annotation1)
+Ngn3KO.colon$annotation1 <- annotation1[
+  as.character(Ngn3KO.colon$SCT_snn_res.0.1)]
+
+DimPlot(Ngn3KO.colon, reduction = "umap", label = F,cols = my5colors.1,split.by = "experiment", pt.size = 0.2, repel = T, label.size = 5, label.box = F) + coord_equal()
+ggsave("figures/ngn3ko_multiplex/umap.annotation1.png", width = 6, height =6)
+
+#Dotplot epithelial markers in main clusters
+Epi.markers <- c("Muc2","Clca1","Spdef","Agr2","Tff3","Lgr5","Ascl2","Axin2","Mki67","Mcm3","Mcm6","Car1","Car2","Selenbp1","Dclk1","Trpm5","Hck","Chga","Pyy","Gcg")
+DotPlot(Ngn3KO.colon, features = Epi.markers,scale.by = "radius", cols = "RdBu")  +
+  geom_point(aes(size=pct.exp), shape = 21, colour="black", stroke=0.5) +
+  # scale_colour_viridis(option="magma") +
+  guides(size=guide_legend(override.aes=list(shape=21, colour="black", fill="grey"))) +
+  scale_fill_gradient2()+
+  ylab("Clusters") + xlab("Markers")+
+  coord_flip()+
+  theme(
+    axis.text.x = element_text(
+      angle = 45,
+      hjust = 1,
+      vjust = 1
+    )
+  )+
+  NULL
+ggsave("figures/ngn3ko_multiplex/Dotplot.Epi.markers.pdf", width = 4.5, height = 5.5)
+
+#### differentially expressed genes across WT and KO colon ####
+Idents(Ngn3KO.colon) <- "experiment"
+DEGs.up.KOvsWT <- FindMarkers(Ngn3KO.colon, ident.1 = "Ngn3KO", ident.2 = "Ctrl", min.pct = 0.1, logfc.threshold = 0.25, only.pos = TRUE)
+write.csv(DEGs.up.KOvsWT,"figures/ngn3ko_multiplex/DEGs.up.KOvsWT.csv")
+DEGs.down.KOvsWT <- FindMarkers(Ngn3KO.colon, ident.1 = "Ctrl", ident.2 = "Ngn3KO", min.pct = 0.1, logfc.threshold = 0.25, only.pos  = TRUE)
+write.csv(DEGs.down.KOvsWT,"figures/ngn3ko_multiplex/DEGs.down.KOvsWT.csv")
+DEGs.all.KOvsWT <- FindMarkers(Ngn3KO.colon, ident.1 = "Ngn3KO", ident.2 = "Ctrl", min.pct = 0.1, logfc.threshold = 0.25)
+write.csv(DEGs.all.KOvsWT,"figures/ngn3ko_multiplex/DEGs.all.KOvsWT.csv")
+DEGs.all.KOvsWT.fc0.2 <- FindMarkers(Ngn3KO.colon, ident.1 = "Ngn3KO", ident.2 = "Ctrl", min.pct = 0.05, logfc.threshold = 0.2)
+write.csv(DEGs.all.KOvsWT.fc0.2,"figures/ngn3ko_multiplex/DEGs.all.KOvsWTfc0.2.csv")
+DEGs.all.KOvsWT.fc0.1 <- FindMarkers(Ngn3KO.colon, ident.1 = "Ngn3KO", ident.2 = "Ctrl", min.pct = 0.05, logfc.threshold = 0.1)
+write.csv(DEGs.all.KOvsWT.fc0.1,"figures/ngn3ko_multiplex/DEGs.all.KOvsWTfc0.1.csv")
+
+#Find top 10 genes significantly up-regulated in KO group (based on the DEGs.up.KOvsWT.csv file )
+top10_genes <- DEGs.up.KOvsWT %>%
+  filter(p_val < 0.05) %>%
+  arrange(desc(avg_log2FC)) %>%
+  slice_head(n = 10) %>%
+  rownames()
+
+####visualization of differentially expressed genes####
+##Set ceiling for DEG data based on log2FC
+Set.ceiling <- function(res.tb,title="",ceiling = 1) {
+  #Move the points out of the range to the ceiling.
+  table_tb <- res.tb
+  idx <- which(table_tb$avg_log2FC > ceiling)
+  table_tb[idx,]$avg_log2FC <- ceiling
+  table_tb
+}
+DEGs.all.KOvsWT.fc0.1.FCceiling <- Set.ceiling(DEGs.all.KOvsWT.fc0.1)
+write.csv(DEGs.all.KOvsWT.fc0.1.FCceiling,"figures/ngn3ko_multiplex/DEGs.all.KOvsWTfc0.1FCceiling.csv")
+#Volcano plot
+p1 <- EnhancedVolcano(DEGs.all.KOvsWT.fc0.1.FCceiling,
+                      lab = rownames(DEGs.all.KOvsWT.fc0.1.FCceiling),
+                      x = 'avg_log2FC',
+                      y = 'p_val_adj',
+                      title = 'Ngn3KO versus Ctrl',
+                      selectLab = c("Ang4","Clca1","Itln1","Retnlb","Lgals2"),
+                      pCutoff = 0.05,
+                      FCcutoff = 0.2,
+                      pointSize = 4,
+                      labSize = 10.0,
+                      drawConnectors = TRUE,
+                      widthConnectors = 0.5,
+                      colAlpha = 2,
+                      gridlines.major = FALSE,
+                      gridlines.minor = FALSE,
+)
+p1+ggplot2::coord_cartesian(xlim = c(-1,1))+
+  ggplot2::scale_x_continuous(breaks = seq(-1,1,1))
+ggsave("figures/ngn3ko_multiplex/VolcanoplotNgn3KOvsCtrlfc0.1.pdf", width =10, height =10)
+
+#Split dotplot by experimental groups
+#Add a new annotation3 to distinguish Ctrl and EEC KO cell clusters
+Ngn3KO.colon$annotation3 <- paste(Ngn3KO.colon$annotation1, Ngn3KO.colon$experiment, sep = "_")
+Idents(Ngn3KO.colon) <- "annotation3"
+Ngn3KO.colon$annotation3 <- factor(Ngn3KO.colon$annotation3,
+                                          levels = c("EEC_Ctrl",
+                                                     "EEC_Ngn3KO",
+                                                     "Tuft Cell_Ctrl",
+                                                     "Tuft Cell_Ngn3KO",
+                                                     "Colonocytes_Ctrl",
+                                                     "Colonocytes_Ngn3KO",
+                                                     "Progenitor_Ctrl",
+                                                     "Progenitor_Ngn3KO",
+                                                     "Goblet Cell_Ctrl",
+                                                     "Goblet Cell_Ngn3KO"))
+
+#Plot dotplot of top 10 genes up-regulated in KO group
+DotPlot(Ngn3KO.colon, features = top10_genes, group.by = "annotation3", scale.by = "size", cols = "RdBu")+
+  geom_point(aes(size=pct.exp), shape = 21, colour="black", stroke=0.5) +
+  # scale_colour_viridis(option="magma") +
+  guides(size=guide_legend(override.aes=list(shape=21, colour="black", fill="grey"))) +
+  scale_fill_gradient2()+
+  ylab("") + xlab("Clusters")+
+  theme(
+    axis.text.x = element_text(
+      angle = 45,
+      hjust = 1,
+      vjust = 1
+    )
+  )+
+  NULL
+ggsave("figures/ngn3ko_multiplex/Dotplot.Up_hi_KO.pdf", width = 6, height = 3)
+
+saveRDS(Ngn3KO.colon, "figures/ngn3ko_multiplex/ngn3ko.colon.rds")
