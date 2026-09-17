@@ -6,6 +6,9 @@ The raw sequencing data associated with this analysis are publicly available thr
 
 GEO accession: GSE295240 [https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE295240]
 
+GEO accession: GSEGSE295239 [https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE295239]
+
+
 ## Detail
 
 The R scripts contain the analysis workflow for the scRNA-seq dataset, including data processing, quality control, downstream analysis, and visualization.
